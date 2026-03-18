@@ -1,15 +1,14 @@
 const prisma = require("../../config/prisma");
-const { addOneHour, isWeekend, parseISODateOnly } = require("../../utils/slots");
+const { addOneHour, isWeekend, parseISODateOnly, formatDate } = require("../../utils/slots");
 
-const COURT_MIN = 1;
-const COURT_MAX = 3;
 const OPEN_HOUR = 6;
 const CLOSE_HOUR = 23;
 const HOLD_MINUTES = 10;
 
+// Validate time
 const validStartTime = (hhmm) => {
   if (!/^\d{2}:\d{2}$/.test(hhmm)) return false;
-  const [hh, mm] = hhmm.split(":").map((x) => Number.parseInt(x, 10));
+  const [hh, mm] = hhmm.split(":").map(Number);
   if (mm !== 0) return false;
   return hh >= OPEN_HOUR && hh < CLOSE_HOUR;
 };
@@ -17,13 +16,12 @@ const validStartTime = (hhmm) => {
 exports.addToCart = async (req, res) => {
   try {
     const userId = req.user.id;
-    const { venueId, date, items } = req.body;
+    const { venueId, items } = req.body;
 
     const vId = Number.parseInt(venueId, 10);
-    if (!Number.isFinite(vId)) return res.status(400).json({ message: "Invalid venueId" });
-
-    const day = parseISODateOnly(date);
-    if (!day) return res.status(400).json({ message: "Invalid date (YYYY-MM-DD)" });
+    if (!Number.isFinite(vId)) {
+      return res.status(400).json({ message: "Invalid venueId" });
+    }
 
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ message: "items[] is required" });
@@ -33,95 +31,138 @@ exports.addToCart = async (req, res) => {
       where: { id: vId },
       select: { id: true, weekdayRate: true, weekendRate: true },
     });
-    if (!venue) return res.status(404).json({ message: "Venue not found" });
 
-    const weekend = isWeekend(day);
-    const price = weekend ? venue.weekendRate : venue.weekdayRate;
+    if (!venue) {
+      return res.status(404).json({ message: "Venue not found" });
+    }
 
     const now = new Date();
     const expiresAt = new Date(now.getTime() + HOLD_MINUTES * 60 * 1000);
 
-    // Cleanup expired cart items (best-effort)
-    await prisma.cartItem.deleteMany({ where: { expiresAt: { lte: now } } });
+    //  Cleanup expired locks
+    await prisma.cartItem.deleteMany({
+      where: { expiresAt: { lte: now } },
+    });
 
-    const normalized = items.map((it) => ({
-      court: Number.parseInt(it.court, 10),
-      startTime: it.startTime,
-    }));
+    // Normalize + validate
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
 
-    for (const it of normalized) {
-      if (!Number.isFinite(it.court) || it.court < COURT_MIN || it.court > COURT_MAX) {
+    const normalized = [];
+
+    for (const it of items) {
+      const dateObj = parseISODateOnly(it.date);
+
+      if (!dateObj) {
+        return res.status(400).json({ message: "Invalid date format" });
+      }
+
+      const court = Number.parseInt(it.court, 10);
+
+      if (!Number.isFinite(court) || court < 1 || court > 3) {
         return res.status(400).json({ message: "court must be 1..3" });
       }
-      if (!validStartTime(it.startTime)) {
-        return res.status(400).json({ message: "startTime must be hourly between 06:00 and 22:00" });
+
+      if (!it.startTime) {
+        return res.status(400).json({ message: "startTime is required" });
       }
+
+      //  BLOCK PAST DATE
+      if (dateObj < today) {
+        return res.status(400).json({
+          message: "Cannot book past dates",
+        });
+      }
+
+      // BLOCK PAST TIME (TODAY)
+      const isToday =
+        dateObj.getFullYear() === today.getFullYear() &&
+        dateObj.getMonth() === today.getMonth() &&
+        dateObj.getDate() === today.getDate();
+
+      if (isToday) {
+        const [hh] = it.startTime.split(":").map(Number);
+        const slotTime = new Date(dateObj);
+        slotTime.setHours(hh, 0, 0, 0);
+
+        if (slotTime <= now) {
+          return res.status(400).json({
+            message: `Slot ${it.startTime} already passed`,
+          });
+        }
+      }
+
+      normalized.push({
+        date: dateObj,
+        court,
+        startTime: it.startTime,
+      });
     }
 
-    // Atomic: verify availability and create holds
+    // 🚀 TRANSACTION
     const created = await prisma.$transaction(async (tx) => {
-      // Check bookings conflicts
+
+      // Booking conflict check
       const bookingConflicts = await tx.booking.findMany({
         where: {
-          venueId: vId,
-          date: day,
-          OR: normalized.map((it) => ({ court: it.court, startTime: it.startTime })),
+          OR: normalized.map((it) => ({
+            venueId: vId,
+            date: it.date,
+            court: it.court,
+            startTime: it.startTime,
+          })),
         },
-        select: { court: true, startTime: true },
+        select: { date: true, court: true, startTime: true },
       });
+
       if (bookingConflicts.length) {
-        return { ok: false, reason: "BOOKED", conflicts: bookingConflicts };
+        return {
+          ok: false,
+          reason: "ALREADY_BOOKED",
+          conflicts: bookingConflicts,
+        };
       }
 
-      // Check cart conflicts (other users)
+      // Cart conflict check
       const cartConflicts = await tx.cartItem.findMany({
         where: {
-          venueId: vId,
-          date: day,
           expiresAt: { gt: now },
-          OR: normalized.map((it) => ({ court: it.court, startTime: it.startTime })),
+          OR: normalized.map((it) => ({
+            venueId: vId,
+            date: it.date,
+            court: it.court,
+            startTime: it.startTime,
+          })),
         },
-        select: { court: true, startTime: true, userId: true },
+        select: { date: true, court: true, startTime: true, userId: true },
       });
-      const takenByOther = cartConflicts.filter((c) => c.userId !== userId);
+
+      const takenByOther = cartConflicts.filter(c => c.userId !== userId);
+
       if (takenByOther.length) {
         return {
           ok: false,
           reason: "IN_CART",
-          conflicts: takenByOther.map((c) => ({ court: c.court, startTime: c.startTime })),
+          conflicts: takenByOther,
         };
       }
 
-      // Upsert-like: if same user already has it, extend expiry; else create
+      //  Insert items
       const results = [];
-      for (const it of normalized) {
-        const endTime = addOneHour(it.startTime);
-        const existing = await tx.cartItem.findUnique({
-          where: {
-            venueId_date_court_startTime: {
-              venueId: vId,
-              date: day,
-              court: it.court,
-              startTime: it.startTime,
-            },
-          },
-        });
 
-        if (existing) {
-          if (existing.userId !== userId) {
-            return { ok: false, reason: "IN_CART", conflicts: [{ court: it.court, startTime: it.startTime }] };
-          }
-          const updated = await tx.cartItem.update({
-            where: { id: existing.id },
-            data: { expiresAt, price },
-          });
-          results.push(updated);
-        } else {
-          const createdItem = await tx.cartItem.create({
+      for (const it of normalized) {
+        const price = isWeekend(it.date)
+          ? venue.weekendRate
+          : venue.weekdayRate;
+
+        const endTime = addOneHour(it.startTime);
+
+        try {
+          const item = await tx.cartItem.create({
             data: {
               userId,
               venueId: vId,
-              date: day,
+              date: it.date,
               court: it.court,
               startTime: it.startTime,
               endTime,
@@ -129,27 +170,48 @@ exports.addToCart = async (req, res) => {
               expiresAt,
             },
           });
-          results.push(createdItem);
+
+          results.push(item);
+
+        } catch (err) {
+          return {
+            ok: false,
+            reason: "IN_CART",
+            conflicts: [
+              {
+                date: it.date,
+                court: it.court,
+                startTime: it.startTime,
+              },
+            ],
+          };
         }
       }
+
       return { ok: true, items: results };
     });
 
+    // Conflict response
     if (!created.ok) {
       return res.status(409).json({
         message: "Slot not available",
         reason: created.reason,
-        conflicts: created.conflicts,
+        conflicts: created.conflicts.map((c) => ({
+          date: formatDate(b.date),
+          court: c.court,
+          startTime: c.startTime,
+        })),
       });
     }
 
+    // Success
     return res.status(201).json({
       message: "Added to cart",
       expiresAt: expiresAt.toISOString(),
       items: created.items.map((i) => ({
         id: i.id,
         venueId: i.venueId,
-        date,
+        date: formatDate(i.date),
         court: i.court,
         startTime: i.startTime,
         endTime: i.endTime,
@@ -157,6 +219,7 @@ exports.addToCart = async (req, res) => {
         expiresAt: i.expiresAt,
       })),
     });
+
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }

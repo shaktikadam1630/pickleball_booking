@@ -48,7 +48,7 @@ exports.checkout = async (req, res) => {
         select: { venueId: true, date: true, court: true, startTime: true },
       });
       if (conflicts.length) {
-        return { ok: false, reason: "CONFLICT", conflicts };
+        return { ok: false, reason: "ALREADY_BOOKED", conflicts };
       }
 
       // Create bookings
@@ -87,18 +87,29 @@ exports.checkout = async (req, res) => {
     });
 
     if (!result.ok) {
-      if (result.reason === "MISSING_OR_EXPIRED") {
-        return res.status(409).json({ message: "Cart items missing or expired" });
+      switch (result.reason) {
+    
+        case "MISSING_OR_EXPIRED":
+          return res.status(409).json({
+            message: "Cart items are missing or expired",
+          });
+    
+        case "ALREADY_BOOKED":
+          return res.status(409).json({
+            message: "Some slots are already booked",
+            conflicts: result.conflicts.map((c) => ({
+              venueId: c.venueId,
+              date: c.date.toISOString().slice(0, 10),
+              court: c.court,
+              startTime: c.startTime,
+            })),
+          });
+    
+        default:
+          return res.status(409).json({
+            message: "Checkout failed",
+          });
       }
-      return res.status(409).json({
-        message: "Checkout conflict",
-        conflicts: (result.conflicts || []).map((c) => ({
-          venueId: c.venueId,
-          date: c.date.toISOString().slice(0, 10),
-          court: c.court,
-          startTime: c.startTime,
-        })),
-      });
     }
 
     const total = result.bookings.reduce((sum, b) => sum + b.price, 0);

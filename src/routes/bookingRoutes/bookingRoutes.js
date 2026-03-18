@@ -6,7 +6,7 @@ const requireBooker = require("../../middleware/requireBooker");
 const { checkout, getMyBookings } = require("../../controllers/bookingController/bookingController");
 
 router.post("/checkout", auth, requireBooker, checkout);
-router.get("/me/bookings", auth, requireBooker, getMyBookings);
+router.get("/me", auth, requireBooker, getMyBookings);
 
 module.exports = router;
 

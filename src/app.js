@@ -15,9 +15,9 @@ app.use(express.json());
 // Routes
 app.use('/auth', authRoutes);
 app.use('/venues', venueRoutes);
-app.use('/', availabilityRoutes);
-app.use('/', cartRoutes);
-app.use('/', bookingRoutes);
+app.use('/availability', availabilityRoutes);
+app.use('/cart', cartRoutes);
+app.use('/booking', bookingRoutes);
 
 
 // 404 handler
