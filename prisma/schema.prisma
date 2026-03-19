@@ -18,7 +18,6 @@ model User {
   venues   Venue[]
 
   bookings Booking[]
-  cartItems CartItem[]
 }
 
 model Venue {
@@ -36,7 +35,6 @@ model Venue {
   owner   User @relation(fields: [ownerId], references: [id])
 
   bookings Booking[]
-  cartItems CartItem[]
 }
 
 model Booking {
@@ -58,25 +56,6 @@ model Booking {
   @@index([venueId, date])
 }
 
-model CartItem {
-  id        Int      @id @default(autoincrement())
-  userId    Int
-  venueId   Int
-  date      DateTime
-  court     Int
-  startTime String
-  endTime   String
-  price     Int
-  expiresAt DateTime
-  createdAt DateTime @default(now())
-
-  user User @relation(fields: [userId], references: [id])
-  venue Venue @relation(fields: [venueId], references: [id])
-
-  @@unique([venueId, date, court, startTime])
-  @@index([userId, expiresAt])
-  @@index([venueId, date])
-}
 
 enum Role {
   OWNER

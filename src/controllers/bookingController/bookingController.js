@@ -1,4 +1,8 @@
 const prisma = require("../../config/prisma");
+const redis = require("../../config/redis");
+const { makeSlotKey, makeItemKey, makeUserSetKey, releaseSlotIfOwner, loadRedisCartItems } = require("../../utils/redisCart");
+
+
 
 exports.checkout = async (req, res) => {
   try {
@@ -9,36 +13,30 @@ exports.checkout = async (req, res) => {
       return res.status(400).json({ message: "cartItemIds[] is required" });
     }
 
-    const ids = cartItemIds.map((x) => Number.parseInt(x, 10)).filter((n) => Number.isFinite(n));
-    if (ids.length !== cartItemIds.length) {
-      return res.status(400).json({ message: "Invalid cartItemIds" });
+    const cartLoad = await loadRedisCartItems(userId, cartItemIds);
+    if (!cartLoad.ok) {
+      if (cartLoad.reason === "INVALID_IDS") {
+        return res.status(400).json({ message: "Invalid cartItemIds" });
+      }
+      return res.status(409).json({ message: "Cart items are missing or expired" });
     }
 
-    const now = new Date();
+    const txItems = cartLoad.items.map((it) => ({
+      id: it.id,
+      venueId: Number(it.venueId),
+      date: new Date(`${it.date}T00:00:00`),
+      court: Number(it.court),
+      startTime: it.startTime,
+      endTime: it.endTime,
+      price: Number(it.price),
+    }));
 
     const result = await prisma.$transaction(async (tx) => {
-      // Load items (must belong to user and be unexpired)
-      const items = await tx.cartItem.findMany({
-        where: { id: { in: ids }, userId, expiresAt: { gt: now } },
-        select: {
-          id: true,
-          venueId: true,
-          date: true,
-          court: true,
-          startTime: true,
-          endTime: true,
-          price: true,
-        },
-      });
-
-      if (items.length !== ids.length) {
-        return { ok: false, reason: "MISSING_OR_EXPIRED" };
-      }
 
       // Re-verify availability vs bookings
       const conflicts = await tx.booking.findMany({
         where: {
-          OR: items.map((it) => ({
+          OR: txItems.map((it) => ({
             venueId: it.venueId,
             date: it.date,
             court: it.court,
@@ -53,7 +51,7 @@ exports.checkout = async (req, res) => {
 
       // Create bookings
       const createdBookings = [];
-      for (const it of items) {
+      for (const it of txItems) {
         try {
           const b = await tx.booking.create({
             data: {
@@ -79,9 +77,6 @@ exports.checkout = async (req, res) => {
           throw e;
         }
       }
-
-      // Clear cart items
-      await tx.cartItem.deleteMany({ where: { id: { in: ids }, userId } });
 
       return { ok: true, bookings: createdBookings };
     });
@@ -110,6 +105,14 @@ exports.checkout = async (req, res) => {
             message: "Checkout failed",
           });
       }
+    }
+
+    // Clear Redis cart and slot locks after successful checkout
+    const userSetKey = makeUserSetKey(userId);
+    for (const it of cartLoad.items) {
+      await releaseSlotIfOwner(it);
+      await redis.del(makeItemKey(it.id));
+      await redis.sRem(userSetKey, it.id);
     }
 
     const total = result.bookings.reduce((sum, b) => sum + b.price, 0);

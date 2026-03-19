@@ -1,9 +1,13 @@
 const prisma = require("../../config/prisma");
+const redis = require("../../config/redis");
+const crypto = require("crypto");
 const { addOneHour, isWeekend, parseISODateOnly, formatDate } = require("../../utils/slots");
+const { makeSlotKey, makeItemKey, makeUserSetKey, releaseSlotIfOwner, getUserCartItems } = require("../../utils/redisCart");
 
 const OPEN_HOUR = 6;
 const CLOSE_HOUR = 23;
 const HOLD_MINUTES = 10;
+const HOLD_SECONDS = HOLD_MINUTES * 60;
 
 // Validate time
 const validStartTime = (hhmm) => {
@@ -12,6 +16,18 @@ const validStartTime = (hhmm) => {
   if (mm !== 0) return false;
   return hh >= OPEN_HOUR && hh < CLOSE_HOUR;
 };
+
+const buildCartItem = ({ itemId, userId, venueId, date, court, startTime, price, expiresAt }) => ({
+  id: itemId,
+  userId,
+  venueId,
+  date,
+  court,
+  startTime,
+  endTime: addOneHour(startTime),
+  price,
+  expiresAt,
+});
 
 exports.addToCart = async (req, res) => {
   try {
@@ -39,11 +55,6 @@ exports.addToCart = async (req, res) => {
     const now = new Date();
     const expiresAt = new Date(now.getTime() + HOLD_MINUTES * 60 * 1000);
 
-    //  Cleanup expired locks
-    await prisma.cartItem.deleteMany({
-      where: { expiresAt: { lte: now } },
-    });
-
     // Normalize + validate
     const today = new Date();
     today.setHours(0, 0, 0, 0);
@@ -65,6 +76,10 @@ exports.addToCart = async (req, res) => {
 
       if (!it.startTime) {
         return res.status(400).json({ message: "startTime is required" });
+      }
+
+      if (!validStartTime(it.startTime)) {
+        return res.status(400).json({ message: "Invalid startTime" });
       }
 
       //  BLOCK PAST DATE
@@ -93,114 +108,107 @@ exports.addToCart = async (req, res) => {
       }
 
       normalized.push({
-        date: dateObj,
+        dateObj,
+        date: formatDate(dateObj),
         court,
         startTime: it.startTime,
       });
     }
 
-    // 🚀 TRANSACTION
-    const created = await prisma.$transaction(async (tx) => {
-
-      // Booking conflict check
-      const bookingConflicts = await tx.booking.findMany({
-        where: {
-          OR: normalized.map((it) => ({
-            venueId: vId,
-            date: it.date,
-            court: it.court,
-            startTime: it.startTime,
-          })),
-        },
-        select: { date: true, court: true, startTime: true },
-      });
-
-      if (bookingConflicts.length) {
-        return {
-          ok: false,
-          reason: "ALREADY_BOOKED",
-          conflicts: bookingConflicts,
-        };
-      }
-
-      // Cart conflict check
-      const cartConflicts = await tx.cartItem.findMany({
-        where: {
-          expiresAt: { gt: now },
-          OR: normalized.map((it) => ({
-            venueId: vId,
-            date: it.date,
-            court: it.court,
-            startTime: it.startTime,
-          })),
-        },
-        select: { date: true, court: true, startTime: true, userId: true },
-      });
-
-      const takenByOther = cartConflicts.filter(c => c.userId !== userId);
-
-      if (takenByOther.length) {
-        return {
-          ok: false,
-          reason: "IN_CART",
-          conflicts: takenByOther,
-        };
-      }
-
-      //  Insert items
-      const results = [];
-
-      for (const it of normalized) {
-        const price = isWeekend(it.date)
-          ? venue.weekendRate
-          : venue.weekdayRate;
-
-        const endTime = addOneHour(it.startTime);
-
-        try {
-          const item = await tx.cartItem.create({
-            data: {
-              userId,
-              venueId: vId,
-              date: it.date,
-              court: it.court,
-              startTime: it.startTime,
-              endTime,
-              price,
-              expiresAt,
-            },
-          });
-
-          results.push(item);
-
-        } catch (err) {
-          return {
-            ok: false,
-            reason: "IN_CART",
-            conflicts: [
-              {
-                date: it.date,
-                court: it.court,
-                startTime: it.startTime,
-              },
-            ],
-          };
-        }
-      }
-
-      return { ok: true, items: results };
+    // Booking conflict check (DB)
+    const bookingConflicts = await prisma.booking.findMany({
+      where: {
+        OR: normalized.map((it) => ({
+          venueId: vId,
+          date: it.dateObj,
+          court: it.court,
+          startTime: it.startTime,
+        })),
+      },
+      select: { date: true, court: true, startTime: true },
     });
 
-    // Conflict response
-    if (!created.ok) {
+    if (bookingConflicts.length) {
       return res.status(409).json({
         message: "Slot not available",
-        reason: created.reason,
-        conflicts: created.conflicts.map((c) => ({
-          date: formatDate(b.date),
+        reason: "ALREADY_BOOKED",
+        conflicts: bookingConflicts.map((c) => ({
+          date: formatDate(c.date),
           court: c.court,
           startTime: c.startTime,
         })),
+      });
+    }
+
+    // Redis cart conflict check + lock (no DB cart check)
+    const createdItems = [];
+    const conflicts = [];
+    const userSetKey = makeUserSetKey(userId);
+
+    for (const it of normalized) {
+      const slotKey = makeSlotKey({
+        venueId: vId,
+        date: it.date,
+        court: it.court,
+        startTime: it.startTime,
+      });
+
+      const itemId = crypto.randomUUID();
+      const lockValue = JSON.stringify({ userId, itemId });
+
+      const lockResult = await redis.set(slotKey, lockValue, { NX: true, EX: HOLD_SECONDS });
+
+      if (lockResult !== "OK") {
+        const existingRaw = await redis.get(slotKey);
+        if (existingRaw) {
+          try {
+            const existing = JSON.parse(existingRaw);
+            if (String(existing.userId) !== String(userId)) {
+              conflicts.push({ date: it.date, court: it.court, startTime: it.startTime });
+              continue;
+            }
+          } catch {
+            conflicts.push({ date: it.date, court: it.court, startTime: it.startTime });
+            continue;
+          }
+        }
+
+        conflicts.push({ date: it.date, court: it.court, startTime: it.startTime });
+        continue;
+      }
+
+      const price = isWeekend(it.dateObj) ? venue.weekendRate : venue.weekdayRate;
+      const expiresAtIso = new Date(Date.now() + HOLD_SECONDS * 1000).toISOString();
+
+      const cartItem = buildCartItem({
+        itemId,
+        userId,
+        venueId: vId,
+        date: it.date,
+        court: it.court,
+        startTime: it.startTime,
+        price,
+        expiresAt: expiresAtIso,
+      });
+
+      const itemKey = makeItemKey(itemId);
+      await redis.set(itemKey, JSON.stringify(cartItem), { EX: HOLD_SECONDS });
+      await redis.sAdd(userSetKey, itemId);
+      createdItems.push(cartItem);
+    }
+
+    if (conflicts.length) {
+      // Keep behavior all-or-nothing for add batch
+      for (const item of createdItems) {
+        await releaseSlotIfOwner(item);
+        await redis.del(makeItemKey(item.id));
+        await redis.sRem(userSetKey, item.id);
+      }
+
+      return res.status(409).json({
+        message: "Slot not available",
+        reason: "IN_CART",
+        conflicts,    
       });
     }
 
@@ -208,16 +216,7 @@ exports.addToCart = async (req, res) => {
     return res.status(201).json({
       message: "Added to cart",
       expiresAt: expiresAt.toISOString(),
-      items: created.items.map((i) => ({
-        id: i.id,
-        venueId: i.venueId,
-        date: formatDate(i.date),
-        court: i.court,
-        startTime: i.startTime,
-        endTime: i.endTime,
-        price: i.price,
-        expiresAt: i.expiresAt,
-      })),
+      items: createdItems,
     });
 
   } catch (err) {
@@ -228,32 +227,18 @@ exports.addToCart = async (req, res) => {
 exports.getMyCart = async (req, res) => {
   try {
     const userId = req.user.id;
-    const now = new Date();
+    const items = await getUserCartItems(userId);
 
-    await prisma.cartItem.deleteMany({ where: { expiresAt: { lte: now } } });
-
-    const items = await prisma.cartItem.findMany({
-      where: { userId, expiresAt: { gt: now } },
-      orderBy: [{ date: "asc" }, { startTime: "asc" }, { court: "asc" }],
-      select: {
-        id: true,
-        venueId: true,
-        date: true,
-        court: true,
-        startTime: true,
-        endTime: true,
-        price: true,
-        expiresAt: true,
-      },
+    items.sort((a, b) => {
+      if (a.date !== b.date) return a.date.localeCompare(b.date);
+      if (a.startTime !== b.startTime) return a.startTime.localeCompare(b.startTime);
+      return a.court - b.court;
     });
 
     const total = items.reduce((sum, it) => sum + it.price, 0);
 
     return res.status(200).json({
-      items: items.map((it) => ({
-        ...it,
-        date: it.date.toISOString().slice(0, 10),
-      })),
+      items,
       total,
     });
   } catch (err) {
@@ -264,15 +249,29 @@ exports.getMyCart = async (req, res) => {
 exports.removeCartItem = async (req, res) => {
   try {
     const userId = req.user.id;
-    const id = Number.parseInt(req.params.id, 10);
-    if (!Number.isFinite(id)) return res.status(400).json({ message: "Invalid id" });
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(400).json({ message: "Invalid id" });
 
-    const item = await prisma.cartItem.findUnique({ where: { id } });
-    if (!item || item.userId !== userId) {
+    const itemRaw = await redis.get(makeItemKey(id));
+    if (!itemRaw) {
       return res.status(404).json({ message: "Cart item not found" });
     }
 
-    await prisma.cartItem.delete({ where: { id } });
+    let item;
+    try {
+      item = JSON.parse(itemRaw);
+    } catch {
+      return res.status(404).json({ message: "Cart item not found" });
+    }
+
+    if (String(item.userId) !== String(userId)) {
+      return res.status(404).json({ message: "Cart item not found" });
+    }
+
+    await releaseSlotIfOwner(item);
+    await redis.del(makeItemKey(id));
+    await redis.sRem(makeUserSetKey(userId), id);
+
     return res.status(200).json({ message: "Removed from cart" });
   } catch (err) {
     return res.status(500).json({ error: err.message });

@@ -1,4 +1,5 @@
 const prisma = require("../../config/prisma");
+const redis = require("../../config/redis");
 const {
   generateStartTimes,
   addOneHour,
@@ -38,57 +39,62 @@ exports.getVenueAvailability = async (req, res) => {
     }
 
     const now = new Date();
+    const currentUserId = req.user.id;
 
     const isToday =
       now.getFullYear() === day.getFullYear() &&
       now.getMonth() === day.getMonth() &&
       now.getDate() === day.getDate();
 
-    // ✅ Proper date range (IMPORTANT FIX)
     const startOfDay = new Date(day);
     startOfDay.setHours(0, 0, 0, 0);
 
     const endOfDay = new Date(day);
     endOfDay.setHours(23, 59, 59, 999);
 
-    // ✅ Cleanup expired cart locks
-    await prisma.cartItem.deleteMany({
-      where: { expiresAt: { lte: now } },
+    // Fetch bookings + active Redis cart locks
+    const bookingsPromise = prisma.booking.findMany({
+      where: {
+        venueId,
+        date: {
+          gte: startOfDay,
+          lte: endOfDay,
+        },
+      },
+      select: { court: true, startTime: true },
     });
 
-    // ✅ Fetch bookings + active cart locks
-    const [bookings, cartItems] = await Promise.all([
-      prisma.booking.findMany({
-        where: {
-          venueId,
-          date: {
-            gte: startOfDay,
-            lte: endOfDay,
-          },
-        },
-        select: { court: true, startTime: true },
-      }),
-      prisma.cartItem.findMany({
-        where: {
-          venueId,
-          date: {
-            gte: startOfDay,
-            lte: endOfDay,
-          },
-          expiresAt: { gt: now },
-        },
-        select: { court: true, startTime: true, userId: true },
-      }),
-    ]);
+    const redisKeysPromise = redis.keys(`cart:slot:${venueId}:${dateStr}:*`);
 
-    // ✅ Fast lookup
-    const bookedSet = new Set(
-      bookings.map((b) => `${b.court}_${b.startTime}`)
-    );
+    const [bookings, redisKeys] = await Promise.all([bookingsPromise, redisKeysPromise]);
 
-    const inCartMap = new Map(
-      cartItems.map((c) => [`${c.court}_${c.startTime}`, c.userId])
-    );
+    const cartItems = [];
+    if (redisKeys.length) {
+      const values = await redis.mGet(redisKeys);
+
+      for (let i = 0; i < redisKeys.length; i += 1) {
+        const value = values[i];
+        if (!value) continue;
+
+        const key = redisKeys[i];
+        const parts = key.split(":");
+        const court = Number(parts[4]);
+        const startTime = parts[5];
+        if (!Number.isFinite(court) || !startTime) continue;
+
+        try {
+          const parsed = JSON.parse(value);
+          cartItems.push({ court, startTime, userId: parsed.userId });
+        } catch {
+          // Skip invalid lock payloads
+        }
+      }
+    }
+
+    // Fast lookup
+    const bookedSet = new Set(bookings.map((b) => `${b.court}_${b.startTime}`));
+
+    const inCartMap = new Map(cartItems.map((c) => [`${c.court}_${c.startTime}`, c.userId]));
 
     const starts = generateStartTimes({
       openHour: OPEN_HOUR,
@@ -104,7 +110,7 @@ exports.getVenueAvailability = async (req, res) => {
       const cells = COURTS_FIXED.map((court) => {
         const key = `${court}_${start}`;
 
-        // ✅ Priority: BOOKED > CART > TIME > AVAILABLE
+        // Priority: BOOKED > CART > TIME > AVAILABLE
         if (bookedSet.has(key)) {
           return { court, state: "BOOKED", price };
         }
@@ -113,15 +119,12 @@ exports.getVenueAvailability = async (req, res) => {
         if (inCartUserId) {
           return {
             court,
-            state:
-              inCartUserId === req.user.id
-                ? "IN_CART_MINE"
-                : "IN_CART",
+            state: String(inCartUserId) === String(currentUserId) ? "IN_CART_MINE" : "IN_CART",
             price,
           };
         }
 
-        // ✅ Past time check
+        // Past time check
         if (isToday) {
           const slotStart = new Date(day);
           const hour = Number.parseInt(start.split(":")[0], 10);
