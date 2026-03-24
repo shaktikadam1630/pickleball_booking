@@ -1,0 +1,84 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+
+model User {
+  id       Int      @id @default(autoincrement())
+  name     String
+  email    String   @unique
+  password String
+  role     Role
+  createdAt DateTime @default(now())
+  venues   Venue[]
+
+  bookings Booking[]
+  cartItems CartItem[]
+}
+
+model Venue {
+  id            Int    @id @default(autoincrement())
+  name          String
+  address       String
+  courts        Int
+  weekdayRate   Int
+  weekendRate   Int
+  phone         String
+  email         String
+  description   String
+
+  ownerId Int
+  owner   User @relation(fields: [ownerId], references: [id])
+
+  bookings Booking[]
+  cartItems CartItem[]
+}
+
+model Booking {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  venueId   Int
+  date      DateTime
+  court     Int
+  startTime String
+  endTime   String
+  price     Int
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+  venue Venue @relation(fields: [venueId], references: [id])
+
+  @@unique([venueId, date, court, startTime])
+  @@index([userId, createdAt])
+  @@index([venueId, date])
+}
+
+model CartItem {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  venueId   Int
+  date      DateTime
+  court     Int
+  startTime String
+  endTime   String
+  price     Int
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+  venue Venue @relation(fields: [venueId], references: [id])
+
+  @@unique([venueId, date, court, startTime])
+  @@index([userId, expiresAt])
+  @@index([venueId, date])
+}
+
+enum Role {
+  OWNER
+  BOOKER
+}
