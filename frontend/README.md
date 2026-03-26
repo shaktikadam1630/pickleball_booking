@@ -1,6 +1,5 @@
 # Pickleball Booking System - Frontend
 
-React + Vite + Tailwind CSS frontend for the Pickleball Booking System booking platform.
 
 ## Features
 
@@ -21,48 +20,6 @@ React + Vite + Tailwind CSS frontend for the Pickleball Booking System booking p
 - **State Management**: React Context API
 - **Routing**: React Router v6
 - **Icons**: Inline SVG
-
-## Project Structure
-
-```
-frontend/pickleball-booking-system/
-├── src/
-│   ├── App.jsx                # Root app component & routes
-│   ├── main.jsx               # Entry point
-│   ├── index.css              # Global styles
-│   ├── api/                   # API client wrappers
-│   │   ├── client.js          # Axios client with auth
-│   │   ├── authApi.js
-│   │   ├── venueApi.js
-│   │   ├── availabilityApi.js
-│   │   ├── cartApi.js
-│   │   └── bookingApi.js
-│   ├── context/
-│   │   └── AuthContext.jsx    # Auth state & JWT management
-│   ├── hooks/
-│   │   └── useAuth.js         # Auth context hook
-│   ├── components/
-│   │   ├── auth/
-│   │   ├── common/
-│   │   └── layout/
-│   ├── pages/
-│   │   ├── VenuesPage.jsx
-│   │   ├── VenueAvailabilityPage.jsx
-│   │   ├── CartPage.jsx
-│   │   ├── CreateVenuePage.jsx
-│   │   ├── BookingsPage.jsx
-│   │   ├── OwnerBookingsPage.jsx
-│   │   ├── ProfilePage.jsx
-│   │   ├── AuthPage.jsx
-│   │   └── NotFoundPage.jsx
-│   ├── utils/
-│   │   └── date.js
-│   └── assets/
-├── vite.config.js             # Vite configuration
-├── tailwind.config.js         # Tailwind configuration
-├── postcss.config.js          # PostCSS configuration
-└── package.json
-```
 
 ## Key Components
 
