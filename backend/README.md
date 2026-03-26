@@ -17,33 +17,7 @@ Node.js Express server with Prisma ORM and MySQL database for the Pickleball Boo
 - **Framework**: Express.js
 - **Database**: MySQL with Prisma ORM
 - **Cache**: Redis (for cart management)
-- **Authentication**: JWT + bcrypt
-- **File Upload**: Multer
 
-## Project Structure
-
-```
-backend/
-├── src/
-│   ├── app.js                 # Express app setup & middleware
-│   ├── config/
-│   │   ├── prisma.js          # Prisma client
-│   │   └── redis.js           # Redis client
-│   ├── controllers/           # Business logic
-│   │   ├── authController/
-│   │   ├── venueController/
-│   │   ├── availabilityController/
-│   │   ├── bookingController/
-│   │   └── cartController/
-│   ├── routes/                # API endpoints
-│   ├── middleware/            # Auth & upload middleware
-│   └── utils/
-├── prisma/
-│   └── schema.prisma          # Database schema
-├── uploads/                   # Static file storage
-├── server.js                  # Server entry point
-└── package.json
-```
 
 ## Database Schema
 
